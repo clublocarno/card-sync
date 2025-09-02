@@ -1,5 +1,7 @@
 Option Compare Database
 
+' Wild Apricot API integration with pagination support
+
 Public OAuthToken As String
 Public OAuthUrl As String
 Public ApiKey As String
@@ -11,6 +13,9 @@ Public ContactFields As IXMLDOMSelection
 ' DELETE Public NumberOfColumns As Integer
 
 Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+' Pagination support
+Private Const PAGE_SIZE As Integer = 100
 
 
 Sub GetDatafromWP(vScope As String)
@@ -45,7 +50,6 @@ End Sub
 
 
 Sub LoadContacts(ByVal baseUrl As String, vScope As String)
-    Dim url As String
     Dim filter As String, selectExpression As String
     Dim LastUpdateTime As String
    
@@ -57,8 +61,6 @@ Sub LoadContacts(ByVal baseUrl As String, vScope As String)
 '        & ",'Access to Level 3 Storage'"
 '        & "'custom-8152854','custom-7532343','custom-7532345','custom-7532340','custom-7532341','custom-7532344'," _
 
-    url = baseUrl
-        
     If vScope = "Incremental" Then ' add filter
         LastUpdate = Format(DLookup("Max(LastUpdate)", "tbl_LastUpdate"), "yyyy-mm-dd")
         LastUpdateTime = Format(DLookup("Max(LastUpdate)", "tbl_LastUpdate"), "hh:mm:ss")
@@ -72,77 +74,42 @@ Sub LoadContacts(ByVal baseUrl As String, vScope As String)
     
     End If
     
-    If Len(filter) > 0 Then
-        url = url + "?" + filter
-    End If
+    Debug.Print "Starting contact retrieval with filter: " & filter
     
-    If Len(selectExpression) > 0 Then
-        If Len(filter) > 0 Then
-            url = url + "&" + selectExpression
-        Else
-            url = url + "?" + selectExpression
-        End If
-    End If
+    On Error GoTo ErrorHandler
     
-    Debug.Print url;
+    ' Use pagination to get all contacts
+    Dim allContacts As IXMLDOMSelection
+    Set allContacts = GetAllContactsPaginated(baseUrl, filter, selectExpression)
     
-    Dim contactsRequestDoc As DOMDocument
-    Set contactsRequestDoc = LoadXml(url)
-    ContactsResultUrl = contactsRequestDoc.SelectSingleNode("/ApiResponse/ResultUrl").text
-    CheckContactsResult
-
-End Sub
-
-
-Sub CheckContactsResult()
-    Dim complete As Boolean, requestState As String
-    complete = False
-    Dim contactsRequestDoc As DOMDocument
-    Dim x As Integer
-    
-    Set contactsRequestDoc = LoadXml(ContactsResultUrl)
-    requestState = contactsRequestDoc.SelectSingleNode("/ApiResponse/State").text
-    Debug.Print requestState
-    
-    x = 0
-    
-    If requestState = "Waiting" Or requestState = "Processing" Then
-        x = x + 1
-        Sleep (10000)   ' Waits for 10 seconds,
-        Debug.Print "Waiting for Response"
-        CheckContactsResult
-        If x = 10 Then
-            SendFailedDownloadMessage ("Failed to load contacts. Timeout.")
-            complete = True
-            Exit Sub
-        End If
-    
-    ElseIf requestState = "Complete" Then
-        Dim contacts As IXMLDOMSelection
-        Set contacts = contactsRequestDoc.SelectNodes("/ApiResponse/Contacts/Contact")
+    ' Process all contacts directly
+    If allContacts.Length > 0 Then
+        Debug.Print "Retrieved " & allContacts.Length & " contacts via pagination"
         
+        ' Clear existing data
         strSQL = "DELETE * FROM tbl_Members"
         DoCmd.RunSQL (strSQL)
-      
-        SaveContacts contacts
-        complete = True
-    
+        
+        ' Save all contacts
+        SaveContacts allContacts
+        
+        ' Update last update timestamp
         strSQL = "Insert Into tbl_LastUpdate (LastUpdate) Values ('" & Now() & "')"
         DoCmd.RunSQL (strSQL)
-    
-    ElseIf requestState = "Failed" Then
-        Dim errMessage As String
-        errMessage = contactsRequestDoc.SelectSingleNode("/ApiResponse/ErrorDetails").text
-'        MsgBox ("Failed to load contacts. Error: " + errMessage)
-        SendFailedDownloadMessage ("Failed to load contacts. Error: " & errMessage)
-        complete = True
-    
+        
+        Debug.Print "Contact processing completed successfully"
+    Else
+        Debug.Print "No contacts found"
     End If
-End Sub
-
-
-Sub test()
-        SendFailedDownloadMessage ("Failed to load contacts. Error: ")
+    
+    Exit Sub
+    
+ErrorHandler:
+    Dim errMessage As String
+    errMessage = "Failed to load contacts via pagination. Error: " & Err.Description
+    Debug.Print errMessage
+    SendFailedDownloadMessage (errMessage)
+    Exit Sub
 
 End Sub
 
@@ -423,3 +390,100 @@ Function LoadAccountUrl(versionUrl As String) As String
     Set accountsUrlNode = versionResourcesXml.SelectSingleNode("//Resource[Name='Accounts']/Url")
     LoadAccountUrl = accountsUrlNode.text
 End Function
+
+' ===== PAGINATION SUPPORT FUNCTIONS =====
+
+Function BuildPaginatedUrl(ByVal baseUrl As String, ByVal filter As String, ByVal selectExpression As String, ByVal pageNumber As Integer) As String
+    Dim url As String
+    url = baseUrl
+    
+    ' Build query parameters
+    Dim queryParams As String
+    queryParams = ""
+    
+    ' Add filter if exists
+    If Len(filter) > 0 Then
+        queryParams = filter
+    End If
+    
+    ' Add select expression if exists
+    If Len(selectExpression) > 0 Then
+        If Len(queryParams) > 0 Then
+            queryParams = queryParams + "&" + selectExpression
+        Else
+            queryParams = selectExpression
+        End If
+    End If
+    
+    ' Add pagination parameters
+    If Len(queryParams) > 0 Then
+        queryParams = queryParams + "&$top=" & PAGE_SIZE & "&$skip=" & ((pageNumber - 1) * PAGE_SIZE)
+    Else
+        queryParams = "$top=" & PAGE_SIZE & "&$skip=" & ((pageNumber - 1) * PAGE_SIZE)
+    End If
+    
+    ' Add query parameters to URL
+    If Len(queryParams) > 0 Then
+        url = url + "?" + queryParams
+    End If
+    
+    BuildPaginatedUrl = url
+End Function
+
+Function GetAllContactsPaginated(ByVal baseUrl As String, ByVal filter As String, ByVal selectExpression As String) As IXMLDOMSelection
+    On Error GoTo ErrorHandler
+    
+    Dim pageNumber As Integer
+    Dim hasMorePages As Boolean
+    
+    ' Create a temporary XML document to hold all contacts
+    Dim tempXmlDoc As DOMDocument
+    Set tempXmlDoc = New DOMDocument
+    tempXmlDoc.LoadXML "<Contacts></Contacts>"
+    
+    pageNumber = 1
+    hasMorePages = True
+    
+    Do While hasMorePages
+        ' Build URL for current page
+        Dim pageUrl As String
+        pageUrl = BuildPaginatedUrl(baseUrl, filter, selectExpression, pageNumber)
+        
+        ' Load contacts for current page
+        Dim pageContactsDoc As DOMDocument
+        Set pageContactsDoc = LoadXml(pageUrl)
+        
+        ' Check if we got any contacts
+        Dim pageContacts As IXMLDOMSelection
+        Set pageContacts = pageContactsDoc.SelectNodes("/ApiResponse/Contacts/Contact")
+        
+        If pageContacts.Length = 0 Then
+            hasMorePages = False
+        Else
+            ' Add contacts from this page to our collection
+            Dim contact As IXMLDOMElement
+            For Each contact In pageContacts
+                Dim clonedContact As IXMLDOMElement
+                Set clonedContact = tempXmlDoc.ImportNode(contact, True)
+                tempXmlDoc.DocumentElement.appendChild clonedContact
+            Next contact
+            
+            ' Check if we got a full page (indicating there might be more)
+            If pageContacts.Length < PAGE_SIZE Then
+                hasMorePages = False
+            End If
+            
+            pageNumber = pageNumber + 1
+        End If
+    Loop
+    
+    ' Return the combined contacts
+    Set GetAllContactsPaginated = tempXmlDoc.SelectNodes("/Contacts/Contact")
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "Error in pagination: " & Err.Description
+    ' Return empty selection on error
+    Set GetAllContactsPaginated = tempXmlDoc.SelectNodes("/Contacts/Contact")
+End Function
+
