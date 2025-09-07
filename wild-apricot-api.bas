@@ -464,7 +464,7 @@ Function GetAllContactsPaginated(ByVal baseUrl As String, ByVal filter As String
             Dim contact As IXMLDOMElement
             For Each contact In pageContacts
                 Dim clonedContact As IXMLDOMElement
-                Set clonedContact = tempXmlDoc.ImportNode(contact, True)
+                Set clonedContact = tempXmlDoc.importNode(contact, True)
                 tempXmlDoc.DocumentElement.appendChild clonedContact
             Next contact
             
